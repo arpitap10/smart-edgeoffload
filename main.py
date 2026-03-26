@@ -1,43 +1,42 @@
+"""Smart Edge Offload Framework - main orchestrator"""
+
 from edge.monitoring import EdgeMonitor
 from edge.congestion_predictor import CongestionPredictor
 from edge.decision_engine import DecisionEngine
 
 
 class SmartEdgeOffloadFramework:
+
     def __init__(self, simulator, edge_executor, cloud_executor):
-        self.simulator = simulator
-        self.edge_executor = edge_executor
+        self.simulator      = simulator
+        self.edge_executor  = edge_executor
         self.cloud_executor = cloud_executor
 
-        # Initialize monitoring and decision components
-        self.monitor = EdgeMonitor()
-        self.predictor = CongestionPredictor()
+        self.monitor         = EdgeMonitor()
+        self.predictor       = CongestionPredictor()
         self.decision_engine = DecisionEngine()
 
     def decide_offloading(self, task):
-        # Implement logic for adaptive task offloading decisions here
-        # Collect current metrics
-        metrics = self.monitor.collect_metrics()
+        # Collect current metrics (also appends to queue_series)
+        self.monitor.collect_metrics()
 
-        # Get queue series for prediction
-        queue_series = self.monitor.queue_series[-10:]  # last 10 measurements
+        # FIX: guard against empty series on very first call;
+        # predictor needs at least 1 point, handles <5 internally
+        queue_series = self.monitor.queue_series[-10:]
+        if not queue_series:
+            queue_series = [0]
 
-        # Predict future congestion
         predicted_queue = self.predictor.predict_congestion(queue_series)
 
-        # Check if edge can physically execute the task
+        # Hard capacity check first — if edge is full, always go to cloud
         if not self.edge_executor.can_execute(task):
             return "cloud"
 
-        # Make decision using decision engine
-        decision = self.decision_engine.decide_execution(predicted_queue, task)
-
-        return decision
+        return self.decision_engine.decide_execution(predicted_queue, task)
 
     def run_task(self, task):
         decision = self.decide_offloading(task)
-        if decision == 'edge':
-            result = self.edge_executor.execute(task)
+        if decision == "edge":
+            return self.edge_executor.execute(task)
         else:
-            result = self.cloud_executor.execute(task)
-        return result
+            return self.cloud_executor.execute(task)
