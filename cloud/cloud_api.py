@@ -11,12 +11,17 @@ class CloudAPI:
         # convert task object to dictionary
         task_data = task.__dict__
 
-        response = requests.post(url, json=task_data)
+        print("[CloudAPI] send_to_cloud payload:", task_data)
+
+        response = requests.post(url, json=task_data, timeout=10)
+        response.raise_for_status()
 
         result = response.json()
+
+        print("[CloudAPI] cloud response:", result)
 
         return ExecutionResult(
             status=result.get("status", "completed"),
             location=result.get("location", "cloud"),
-            latency=result.get("latency", 0.0)
+            completion_time=result.get("latency", 0.0)
         )

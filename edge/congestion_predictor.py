@@ -1,10 +1,13 @@
-from statsmodels.tsa.holtwinters import ExponentialSmoothing
-
-
 class CongestionPredictor:
 
     def __init__(self):
-        pass
+        self.model = None
+        try:
+            from statsmodels.tsa.holtwinters import ExponentialSmoothing
+            self.ExponentialSmoothing = ExponentialSmoothing
+        except ImportError:
+            print("Warning: statsmodels not available, using simple average")
+            self.ExponentialSmoothing = None
 
     def predict_congestion(self, queue_series):
         """
@@ -18,23 +21,27 @@ class CongestionPredictor:
         if len(queue_series) < 5:
             return queue_series[-1] if queue_series else 0
 
-        try:
-            # Holt-Winters model
-            model = ExponentialSmoothing(
-                queue_series,
-                trend='add',
-                seasonal=None
-            )
+        # Try Holt-Winters first
+        if self.ExponentialSmoothing is not None:
+            try:
+                # Holt-Winters model
+                model = self.ExponentialSmoothing(
+                    queue_series,
+                    trend='add',
+                    seasonal=None
+                )
 
-            fitted_model = model.fit()
+                fitted_model = model.fit()
 
-            # Predict next timestep
-            forecast = fitted_model.forecast(1)
+                # Predict next timestep
+                forecast = fitted_model.forecast(1)
 
-            predicted_queue = float(forecast[0])
+                predicted_queue = float(forecast[0])
 
-            return predicted_queue
+                return max(0, predicted_queue)  # Ensure non-negative
 
-        except Exception:
-            # fallback if model fails
-            return queue_series[-1]
+            except Exception as e:
+                print(f"Holt-Winters failed: {e}, falling back to moving average")
+
+        # Fallback to simple moving average
+        return sum(queue_series[-5:]) / len(queue_series[-5:])

@@ -17,5 +17,5 @@ def process_task(task: IoTTask) -> ExecutionResult:
     return ExecutionResult(
         status="completed",
         location="cloud",
-        latency=latency
+        completion_time=latency
     )
