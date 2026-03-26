@@ -6,7 +6,7 @@ class CloudAPI:
 
     def send_to_cloud(self, task: IoTTask) -> ExecutionResult:
 
-        url = "http://13.60.34.204:8000/execute_task"
+        url = "http://13.53.132.84:8000/execute_task"
 
         # convert task object to dictionary
         task_data = task.__dict__
