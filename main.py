@@ -16,26 +16,55 @@ class SmartEdgeOffloadFramework:
         self.predictor       = CongestionPredictor()
         self.decision_engine = DecisionEngine()
 
+        # ✅ Task counter (NEW)
+        self.task_counter = 0
+
     def decide_offloading(self, task):
-        # Collect current metrics (also appends to queue_series)
+        # ✅ Increment task number
+        self.task_counter += 1
+
+        print("\n==============================")
+        print(f"[Task {self.task_counter:02d}] "
+              f"device={task.device_id} size={task.task_size:.2f}MB")
+
+        # Step 1: Collect metrics
         self.monitor.collect_metrics()
 
-        # FIX: guard against empty series on very first call;
-        # predictor needs at least 1 point, handles <5 internally
         queue_series = self.monitor.queue_series[-10:]
         if not queue_series:
             queue_series = [0]
 
+        print(f"[Monitor] Recent queue={queue_series}")
+
+        # Step 2: Predict congestion
         predicted_queue = self.predictor.predict_congestion(queue_series)
+        print(f"[Predictor] Predicted queue={predicted_queue:.2f}")
 
-        # Hard capacity check first — if edge is full, always go to cloud
-        if not self.edge_executor.can_execute(task):
-            return "cloud"
+        # Step 3: Decision engine
+        decision, reason = self.decision_engine.decide_execution(
+            predicted_queue, task
+        )
 
-        return self.decision_engine.decide_execution(predicted_queue, task)
+        # Step 4: Edge capacity override
+        if decision == "edge":
+            if not self.edge_executor.can_execute(task):
+                print("[Override] Edge cannot execute → switching to CLOUD")
+                final_decision = "cloud"
+                final_reason = "Edge capacity exceeded"
+            else:
+                final_decision = "edge"
+                final_reason = reason
+        else:
+            final_decision = "cloud"
+            final_reason = reason
+
+        print(f"[Final Decision] {final_decision.upper()} → {final_reason}")
+
+        return final_decision
 
     def run_task(self, task):
         decision = self.decide_offloading(task)
+
         if decision == "edge":
             return self.edge_executor.execute(task)
         else:

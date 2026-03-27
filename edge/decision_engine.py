@@ -11,30 +11,36 @@ class DecisionEngine:
     """
 
     def __init__(self,
-                 # FIX: default thresholds now come from Config instead of magic numbers
                  queue_threshold: float = Config.QUEUE_LENGTH_THRESHOLD,
                  large_task_threshold: float = Config.LARGE_TASK_THRESHOLD):
-        """
-        Args:
-            queue_threshold       : predicted queue length above which tasks offload
-            large_task_threshold  : task size (MB) above which tasks offload
-        """
-        self.queue_threshold      = queue_threshold
+
+        self.queue_threshold = queue_threshold
         self.large_task_threshold = large_task_threshold
 
-    def decide_execution(self, predicted_queue: float, task: IoTTask) -> str:
+    def decide_execution(self, predicted_queue: float, task: IoTTask):
         """
         Decide where a task should execute.
 
         Returns:
-            "edge" or "cloud"
+            (decision, reason)
         """
-        # Offload if network congestion is predicted
+
+        print(f"[Decision] Predicted queue={predicted_queue:.2f}, "
+              f"Task size={task.task_size:.2f}MB")
+
+        # Rule 1: Congestion-based offloading
         if predicted_queue >= self.queue_threshold:
-            return "cloud"
+            reason = f"Predicted queue {predicted_queue:.2f} >= threshold {self.queue_threshold}"
+            print(f"[Decision] CLOUD → {reason}")
+            return "cloud", reason
 
-        # Offload if task is too large for edge
+        # Rule 2: Large task offloading
         if task.task_size >= self.large_task_threshold:
-            return "cloud"
+            reason = f"Task size {task.task_size:.2f}MB >= threshold {self.large_task_threshold}MB"
+            print(f"[Decision] CLOUD → {reason}")
+            return "cloud", reason
 
-        return "edge"
+        # Default: Edge execution
+        reason = "Low predicted congestion and small task"
+        print(f"[Decision] EDGE → {reason}")
+        return "edge", reason
