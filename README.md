@@ -1,12 +1,9 @@
-In large-scale IoT systems, dynamic network conditions
-such as congestion, bandwidth fluctuations, and varying traffic
-loads significantly impact task offloading performance. Exist
-ing approaches either assume static network environments or
-rely on computationally intensive models that are impractical
-for lightweight edge deployment. Moreover, most frameworks
-react to congestion after it occurs rather than predicting it
-proactively.
-Therefore, there is a need for a scalable and lightweight
-network-aware offloading framework that incorporates real
-time congestion prediction and adaptive task placement across
-edge–cloud environments.
+This project simulates an IoT environment where tasks are dynamically offloaded to either:
+
+⚡ Edge → Low latency, limited capacity
+
+☁️ Cloud → High latency, scalable
+
+Instead of static thresholds, the system uses Holt-Winters exponential smoothing to the problem of task offloading in edge-cloud environments. Unlike traditional threshold-based systems, this approach introduces a dynamic and context-aware decision mechanism that adapts to changing network conditions in real time.
+
+The use of a cost-driven decision model further strengthens the system by incorporating multiple factors such as congestion and execution overhead into a unified framework. This results in more balanced resource utilization and improved overall system performance.
