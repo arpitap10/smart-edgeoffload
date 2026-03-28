@@ -1,122 +1,150 @@
-"""
-Run experiments for smart edge offloading framework
-"""
-
 import sys
 import os
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from simulator.device_simulator import IoTSimulator
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from edge.edge_executor import EdgeExecutor
-from edge.congestion_predictor import CongestionPredictor
-from cloud.cloud_api import CloudAPI
-from main import SmartEdgeOffloadFramework
-import time
+from cloud.executor import CloudExecutor
+from edge.decision_engine import DecisionEngine
+from shared.data_models import IoTTask
+import random
+import matplotlib.pyplot as plt
 
+NUM_DEVICES = 500
+EPISODES = 5
 
-def run_pipeline():
-    """
-    Integrate simulator, monitoring, predictor,
-    decision engine, and execution.
-    """
-    print("Starting Smart Edge Offloading Experiment...")
+# -------- BASELINE DECISION --------
+def baseline_decide(task):
+    # simple heuristic
+    if task.size * task.compute < 15:
+        return "edge"
+    else:
+        return "cloud"
 
-    simulator      = IoTSimulator(num_devices=10)
-    edge_executor  = EdgeExecutor()
-    cloud_executor = CloudAPI()
+# -------- TASK GENERATION --------
+def generate_tasks(start_id):
+    tasks = []
+    for i in range(NUM_DEVICES):
+        task = IoTTask(
+            task_id=start_id + i,
+            size=random.uniform(1, 10),
+            compute=random.uniform(1, 5),
+            latency_req=random.uniform(1, 5)
+        )
+        tasks.append(task)
+    return tasks
 
-    # Keep a reference to the predictor so we can log HW predictions
-    predictor = CongestionPredictor()
+def main():
+    edge = EdgeExecutor()
+    cloud = CloudExecutor()
+    decision_engine = DecisionEngine()
 
-    framework = SmartEdgeOffloadFramework(
-        simulator=simulator,
-        edge_executor=edge_executor,
-        cloud_executor=cloud_executor
-    )
-    # Share the same predictor instance so logs match actual decisions
-    framework.predictor = predictor
+    task_counter = 0
 
-    num_tasks = 50
-    results   = []
+    # ----- OUR MODEL METRICS -----
+    our_delay = []
+    our_energy = []
 
-    print(f"\nRunning {num_tasks} tasks...\n")
+    # ----- BASELINE METRICS -----
+    base_delay = []
+    base_energy = []
 
-    for i in range(num_tasks):
-        task = simulator.generate_task()
+    for ep in range(EPISODES):
+        tasks = generate_tasks(task_counter)
+        task_counter += NUM_DEVICES
 
-        # --- FIX: log the Holt-Winters prediction before executing ---
-        queue_series = framework.monitor.queue_series[-10:] or [0]
-        if len(queue_series) >= 5:
-            predicted_q = predictor.predict_congestion(queue_series)
-            hw_note = f"HW predicted queue={predicted_q:.2f}"
-        else:
-            predicted_q = queue_series[-1] if queue_series else 0
-            hw_note = f"fallback avg queue={predicted_q:.2f} (need 5+ pts for HW)"
+        edge_queue = random.uniform(0, 20)
+        cloud_queue = random.uniform(0, 20)
 
-        print(f"Task {i+1:02d} | device={task.device_id} | size={task.task_size:.2f}MB | {hw_note}")
+        total_delay_our = 0
+        total_energy_our = 0
 
-        start_time = time.time()
-        result     = framework.run_task(task)
-        total_time = time.time() - start_time
+        total_delay_base = 0
+        total_energy_base = 0
 
-        results.append({
-            'task_id':         i + 1,
-            'device':          task.device_id,
-            'task_size':       task.task_size,
-            'decision':        result.location,
-            'completion_time': result.completion_time,
-            'total_time':      total_time,
-            'predicted_queue': predicted_q,
-        })
+        for task in tasks:
+            # ---------- OUR MODEL ----------
+            edge_est = edge.estimate(task)
+            cloud_est = cloud.estimate(task)
 
-        print(f"         -> {result.location.upper()} | "
-              f"completion={result.completion_time:.3f}s | "
-              f"total={total_time:.3f}s\n")
+            decision = decision_engine.decide(
+                task, edge_est, cloud_est,
+                edge_queue, cloud_queue
+            )
 
-    analyze_results(results)
+            if decision == "edge":
+                result = edge.execute(task)
+            else:
+                result = cloud.execute(task)
 
+            total_delay_our += result.execution_time
+            total_energy_our += result.energy
 
-def analyze_results(results):
-    """Analyze and print experiment results — FIX: was printing everything twice"""
-    print("\n" + "=" * 50)
-    print("EXPERIMENT RESULTS")
-    print("=" * 50)
+            # ---------- BASELINE ----------
+            base_decision = baseline_decide(task)
 
-    total_tasks  = len(results)
-    edge_tasks   = sum(1 for r in results if r['decision'] == 'edge')
-    cloud_tasks  = sum(1 for r in results if r['decision'] == 'cloud')
+            if base_decision == "edge":
+                result_b = edge.execute(task)
+            else:
+                result_b = cloud.execute(task)
 
-    print(f"Total tasks       : {total_tasks}")
-    print(f"Edge executions   : {edge_tasks}  ({edge_tasks  / total_tasks * 100:.1f}%)")
-    print(f"Cloud executions  : {cloud_tasks} ({cloud_tasks / total_tasks * 100:.1f}%)")
+            total_delay_base += result_b.execution_time
+            total_energy_base += result_b.energy
 
-    edge_times  = [r['completion_time'] for r in results if r['decision'] == 'edge']
-    cloud_times = [r['completion_time'] for r in results if r['decision'] == 'cloud']
+        our_delay.append(total_delay_our / NUM_DEVICES)
+        our_energy.append(total_energy_our / NUM_DEVICES)
 
-    if edge_times:
-        print(f"Avg edge completion time  : {sum(edge_times)  / len(edge_times):.3f}s")
-    if cloud_times:
-        # FIX: this was 0.000s before because CloudAPI returned server's latency field
-        # Now it reflects true measured RTT
-        print(f"Avg cloud completion time : {sum(cloud_times) / len(cloud_times):.3f}s")
+        base_delay.append(total_delay_base / NUM_DEVICES)
+        base_energy.append(total_energy_base / NUM_DEVICES)
 
-    edge_sizes  = [r['task_size'] for r in results if r['decision'] == 'edge']
-    cloud_sizes = [r['task_size'] for r in results if r['decision'] == 'cloud']
+        print(f"Episode {ep+1} done")
 
-    if edge_sizes:
-        print(f"Avg edge task size        : {sum(edge_sizes)  / len(edge_sizes):.2f}MB")
-    if cloud_sizes:
-        print(f"Avg cloud task size       : {sum(cloud_sizes) / len(cloud_sizes):.2f}MB")
+    # ===== GRAPH 1: DELAY COMPARISON =====
+    plt.figure()
+    plt.plot(our_delay, label="Proposed Model")
+    plt.plot(base_delay, label="Baseline")
+    plt.legend()
+    plt.title("Delay Comparison")
+    plt.xlabel("Episode")
+    plt.ylabel("Average Delay")
+    plt.savefig("comparison_delay.png")
 
-    # Holt-Winters summary
-    hw_predictions = [r['predicted_queue'] for r in results]
-    print(f"\nHolt-Winters queue predictions:")
-    print(f"  Min  : {min(hw_predictions):.2f}")
-    print(f"  Max  : {max(hw_predictions):.2f}")
-    print(f"  Mean : {sum(hw_predictions) / len(hw_predictions):.2f}")
+    # ===== GRAPH 2: ENERGY COMPARISON =====
+    plt.figure()
+    plt.plot(our_energy, label="Proposed Model")
+    plt.plot(base_energy, label="Baseline")
+    plt.legend()
+    plt.title("Energy Comparison")
+    plt.xlabel("Episode")
+    plt.ylabel("Average Energy")
+    plt.savefig("comparison_energy.png")
 
-    print("\nExperiment completed successfully!")
+    # ===== GRAPH 3: FINAL BAR GRAPH (IMPORTANT 🔥) =====
+    labels = ["Delay", "Energy"]
 
+    our_avg = [
+        sum(our_delay)/len(our_delay),
+        sum(our_energy)/len(our_energy)
+    ]
+
+    base_avg = [
+        sum(base_delay)/len(base_delay),
+        sum(base_energy)/len(base_energy)
+    ]
+
+    x = range(len(labels))
+
+    plt.figure()
+    plt.bar(x, our_avg, label="Proposed Model")
+    plt.bar(x, base_avg, bottom=our_avg, alpha=0.5, label="Baseline")
+    plt.xticks(x, labels)
+    plt.title("Overall Performance Comparison")
+    plt.legend()
+    plt.savefig("final_comparison.png")
+
+    print("\nSaved graphs:")
+    print("comparison_delay.png")
+    print("comparison_energy.png")
+    print("final_comparison.png")
 
 if __name__ == "__main__":
-    run_pipeline()
+    main()

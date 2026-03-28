@@ -1,26 +1,15 @@
 from dataclasses import dataclass
-from typing import Dict
-import time
-
 
 @dataclass
 class IoTTask:
-    device_id: str
-    timestamp: float
-    task_size: float
-    payload: Dict
-
-
-@dataclass
-class NetworkMetrics:
-    latency_ms: float
-    packet_loss: float
-    queue_length: int
-    cpu_usage: float
-
+    task_id: int
+    size: float          # in MB
+    compute: float       # CPU cycles per unit
+    latency_req: float   # seconds
 
 @dataclass
 class ExecutionResult:
-    status: str
+    task_id: int
     location: str
-    completion_time: float
+    execution_time: float
+    energy: float

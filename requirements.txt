@@ -3,4 +3,4 @@ psutil
 numpy
 pandas
 requests
-flask
+matplotlib
