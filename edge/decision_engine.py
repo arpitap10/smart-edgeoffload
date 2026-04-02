@@ -1,115 +1,152 @@
-"""Decision Engine — multi-objective cost-based offloading"""
+"""Prediction-aware multi-objective offloading decision engine."""
+
+from __future__ import annotations
+
+import math
 
 
 class DecisionEngine:
-
-    def __init__(self, alpha: float = 0.5,
-                       beta:  float = 0.3,
-                       gamma: float = 0.2):
+    def __init__(
+        self,
+        alpha: float = 0.55,
+        beta: float = 0.20,
+        gamma: float = 0.25,
+        offload_margin: float = 0.08,
+        uncertainty_weight: float = 0.35,
+    ):
         assert abs(alpha + beta + gamma - 1.0) < 1e-6, "Weights must sum to 1.0"
-        self.alpha = alpha   # delay weight
-        self.beta  = beta    # energy weight
-        self.gamma = gamma   # congestion weight
+        self.alpha = alpha
+        self.beta = beta
+        self.gamma = gamma
+        self.offload_margin = offload_margin
+        self.uncertainty_weight = uncertainty_weight
 
-    # ── physical models ───────────────────────────────────────────────
-    def _edge_energy(self, execution_time: float) -> float:
-        """Edge: local CPU power ~0.5W (Raspberry Pi class)"""
-        return 0.5 * execution_time
+    def _queue_pressure(self, backlog: float, scale: float = 1.0) -> float:
+        return 1.0 - math.exp(-max(0.0, backlog) / max(scale, 1e-6))
 
-    def _cloud_energy(self, task) -> float:
-        """Cloud: WiFi uplink TX power ~1W over transmission time"""
-        P_tx, bw = 1.0, 10.0
-        tx_time  = (task.size * 8) / (bw * 1000)
-        return P_tx * tx_time
-
-    def _latency_penalty(self, delay: float, latency_req: float) -> float:
-        """Proportional penalty for missing deadline."""
+    def _deadline_penalty(self, delay: float, latency_req: float) -> float:
         if latency_req <= 0:
             return 1.0
-        excess = max(0.0, delay - latency_req)
-        return 1.0 + (excess / latency_req)
+        excess_ratio = max(0.0, delay - latency_req) / latency_req
+        return 1.0 + (1.75 * excess_ratio)
 
-    def _congestion_cost(self, location: str,
-                         edge_q: float, cloud_q: float) -> float:
-        """
-        Asymmetric congestion: edge queue affects edge cost,
-        cloud upload congestion affects cloud cost.
-        Normalised to [0, 1].
-        """
-        MAX_Q = 20.0
-        raw = edge_q if location == "edge" else cloud_q
-        return min(1.0, raw / MAX_Q)
+    def _energy_reference(self, task) -> float:
+        return max(0.2, 0.18 * task.size + 0.015 * task.compute)
 
-    def compute_cost(self, delay, energy, congestion, latency_req):
-        """
-        Weighted cost with proportional latency penalty.
-        REF values normalise delay and energy to comparable scales:
-          - REF_DELAY  = 1.0s  (typical task completion target)
-          - REF_ENERGY = 0.5J  (mid-range between edge ~0.25J and cloud ~0.8J)
-        """
-        REF_DELAY  = 1.0
-        REF_ENERGY = 0.5
-        penalty = self._latency_penalty(delay, latency_req)
-        return penalty * (
-            self.alpha * (delay  / REF_DELAY)  +
-            self.beta  * (energy / REF_ENERGY) +
-            self.gamma * congestion
+    def _uncertainty_ratio(self, task, estimate: dict) -> float:
+        return estimate.get("uncertainty", 0.0) / max(task.latency_req, 1e-3)
+
+    def _risk_penalty(self, task, estimate: dict) -> float:
+        if estimate.get("location") != "cloud":
+            return 0.0
+
+        uncertainty_ratio = self._uncertainty_ratio(task, estimate)
+        deadline_tightness = 1.0 / max(task.latency_req, 0.2)
+        return self.uncertainty_weight * (
+            uncertainty_ratio + estimate.get("risk", 0.0) * deadline_tightness
         )
 
-    # ── original decide (kept for compatibility) ──────────────────────
-    def decide(self, task, edge_estimate, cloud_estimate,
-               edge_queue, cloud_queue=0.0) -> str:
-        decision, _ = self.decide_with_reason(
-            task, edge_estimate, cloud_estimate, edge_queue, cloud_queue)
+    def compute_cost(self, task, estimate: dict, effective_backlog: float) -> tuple[float, dict]:
+        effective_delay = estimate["delay"] + estimate.get("uncertainty", 0.0)
+        delay_ratio = effective_delay / max(task.latency_req, 1e-3)
+        energy_ratio = estimate["energy"] / self._energy_reference(task)
+        congestion = self._queue_pressure(effective_backlog, scale=max(task.latency_req, 0.25))
+        penalty = self._deadline_penalty(effective_delay, task.latency_req)
+        risk_penalty = self._risk_penalty(task, estimate)
+
+        raw_cost = (
+            self.alpha * delay_ratio
+            + self.beta * energy_ratio
+            + self.gamma * congestion
+            + risk_penalty
+        )
+        return penalty * raw_cost, {
+            "delay_ratio": delay_ratio,
+            "energy_ratio": energy_ratio,
+            "congestion": congestion,
+            "penalty": penalty,
+            "uncertainty": estimate.get("uncertainty", 0.0),
+            "risk_penalty": risk_penalty,
+        }
+
+    def decide(
+        self,
+        task,
+        edge_estimate,
+        cloud_estimate,
+        current_edge_backlog: float,
+        current_cloud_backlog: float,
+        predicted_edge_backlog: float | None = None,
+        predicted_cloud_backlog: float | None = None,
+    ) -> str:
+        decision, _, _, _ = self.decide_with_reason(
+            task,
+            edge_estimate,
+            cloud_estimate,
+            current_edge_backlog=current_edge_backlog,
+            current_cloud_backlog=current_cloud_backlog,
+            predicted_edge_backlog=predicted_edge_backlog,
+            predicted_cloud_backlog=predicted_cloud_backlog,
+        )
         return decision
 
-    # ── decide + human-readable reason ───────────────────────────────
-    def decide_with_reason(self, task, edge_estimate, cloud_estimate,
-                           edge_queue, cloud_queue=0.0):
-        """Returns (decision: str, reason: str)"""
-        ed   = edge_estimate["delay"]
-        cd   = cloud_estimate["delay"]
-        ee   = self._edge_energy(ed)
-        ce   = self._cloud_energy(task)
-        ec   = self._congestion_cost("edge",  edge_queue, cloud_queue)
-        cc   = self._congestion_cost("cloud", edge_queue, cloud_queue)
-        lreq = task.latency_req
+    def decide_with_reason(
+        self,
+        task,
+        edge_estimate,
+        cloud_estimate,
+        current_edge_backlog: float,
+        current_cloud_backlog: float = 0.0,
+        predicted_edge_backlog: float | None = None,
+        predicted_cloud_backlog: float | None = None,
+    ):
+        edge_backlog = current_edge_backlog
+        if predicted_edge_backlog is not None:
+            edge_backlog = max(
+                current_edge_backlog,
+                0.85 * predicted_edge_backlog + 0.15 * current_edge_backlog,
+            )
 
-        edge_cost  = self.compute_cost(ed, ee, ec, lreq)
-        cloud_cost = self.compute_cost(cd, ce, cc, lreq)
+        cloud_backlog = current_cloud_backlog
+        if predicted_cloud_backlog is not None:
+            cloud_backlog = max(
+                current_cloud_backlog,
+                0.75 * predicted_cloud_backlog + 0.25 * current_cloud_backlog,
+            )
 
-        decision = "edge" if edge_cost <= cloud_cost else "cloud"
+        edge_cost, edge_terms = self.compute_cost(task, edge_estimate, edge_backlog)
+        cloud_cost, cloud_terms = self.compute_cost(task, cloud_estimate, cloud_backlog)
 
-        # human-readable reason
-        if decision == "edge":
-            margin = cloud_cost - edge_cost
-            if ed < cd:
-                reason = (f"edge faster ({ed:.4f}s vs {cd:.4f}s), "
-                          f"cost margin={margin:.4f}")
-            elif ec < cc:
-                reason = (f"cloud more congested, edge cheaper "
-                          f"by {margin:.4f}")
-            else:
-                reason = (f"edge cost={edge_cost:.4f} < "
-                          f"cloud cost={cloud_cost:.4f} "
-                          f"(margin={margin:.4f})")
+        if cloud_cost < (1.0 - self.offload_margin) * edge_cost:
+            decision = "cloud"
         else:
-            margin = edge_cost - cloud_cost
-            ep = self._latency_penalty(ed, lreq)
-            if ep > 1.2:
-                reason = (f"edge misses deadline "
-                          f"({ed:.4f}s > req={lreq:.2f}s, "
-                          f"penalty={ep:.2f}x)")
-            elif ec > 0.6:
-                reason = (f"edge congestion high "
-                          f"(queue={edge_queue:.1f}, "
-                          f"cong={ec:.2f}), cloud cheaper by {margin:.4f}")
-            elif cd < ed:
-                reason = (f"cloud faster ({cd:.4f}s vs {ed:.4f}s), "
-                          f"cost margin={margin:.4f}")
-            else:
-                reason = (f"cloud cost={cloud_cost:.4f} < "
-                          f"edge cost={edge_cost:.4f} "
-                          f"(margin={margin:.4f})")
+            decision = "edge"
 
-        return decision, reason
+        chosen_cost = edge_cost if decision == "edge" else cloud_cost
+        other_cost = cloud_cost if decision == "edge" else edge_cost
+        chosen_estimate = edge_estimate if decision == "edge" else cloud_estimate
+        chosen_terms = edge_terms if decision == "edge" else cloud_terms
+        margin = other_cost - chosen_cost
+
+        reason = (
+            f"{decision.upper()} | margin={margin:.3f} "
+            f"delay={chosen_estimate['delay']:.3f}s "
+            f"wait={chosen_estimate['wait_time']:.3f}s "
+            f"energy={chosen_estimate['energy']:.3f}J "
+            f"cong={chosen_terms['congestion']:.2f} "
+            f"unc={chosen_terms['uncertainty']:.3f}s "
+            f"penalty={chosen_terms['penalty']:.2f}"
+        )
+
+        diagnostics = {
+            "edge_cost": edge_cost,
+            "cloud_cost": cloud_cost,
+            "effective_edge_backlog": edge_backlog,
+            "effective_cloud_backlog": cloud_backlog,
+            "edge_terms": edge_terms,
+            "cloud_terms": cloud_terms,
+        }
+        return decision, reason, diagnostics, {
+            "edge": edge_estimate,
+            "cloud": cloud_estimate,
+        }

@@ -1,21 +1,16 @@
 import time
-from shared.data_models import IoTTask, ExecutionResult
+
+from shared.data_models import ExecutionResult, IoTTask
 
 
 def process_task(task: IoTTask) -> ExecutionResult:
-    """
-    Process task in cloud worker.
-    """
-
+    """Minimal cloud worker helper used by legacy entry points."""
     start = time.time()
-
-    # simulate heavy computation
-    time.sleep(0.3)
-
+    time.sleep(0.05)
     latency = time.time() - start
-
     return ExecutionResult(
-        status="completed",
+        task_id=task.task_id,
         location="cloud",
-        completion_time=latency
+        execution_time=latency,
+        energy=0.0,
     )
