@@ -1,0 +1,6 @@
+statsmodels
+psutil
+numpy
+pandas
+requests
+matplotlib
