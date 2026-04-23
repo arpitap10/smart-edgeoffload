@@ -102,17 +102,16 @@ class DecisionEngine:
     ):
         edge_backlog = current_edge_backlog
         if predicted_edge_backlog is not None:
-            edge_backlog = max(
-                current_edge_backlog,
-                0.85 * predicted_edge_backlog + 0.15 * current_edge_backlog,
-            )
+            # Use prediction directly — if it sees congestion rising ahead,
+            # weight it strongly so we offload BEFORE the spike hits.
+            # If prediction < current, trust it (congestion easing → prefer edge).
+            rising = predicted_edge_backlog > current_edge_backlog
+            w_pred = 0.75 if rising else 0.55
+            edge_backlog = w_pred * predicted_edge_backlog + (1 - w_pred) * current_edge_backlog
 
         cloud_backlog = current_cloud_backlog
         if predicted_cloud_backlog is not None:
-            cloud_backlog = max(
-                current_cloud_backlog,
-                0.75 * predicted_cloud_backlog + 0.25 * current_cloud_backlog,
-            )
+            cloud_backlog = 0.65 * predicted_cloud_backlog + 0.35 * current_cloud_backlog
 
         edge_cost, edge_terms = self.compute_cost(task, edge_estimate, edge_backlog)
         cloud_cost, cloud_terms = self.compute_cost(task, cloud_estimate, cloud_backlog)
