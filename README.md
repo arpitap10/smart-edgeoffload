@@ -63,7 +63,7 @@ smart-edgeoffload/
 ## Installation
 
 ```bash
-git clone <repo>
+git clone "https://github.com/arpitap10/smart-edgeoffload"
 cd smart-edgeoffload
 pip install -r requirements.txt
 ```
@@ -106,18 +106,6 @@ To run against a live cloud server instead, set `USE_REAL_CLOUD = True` in `run_
 | **`predictive`** | **Cost-based using HW-forecast backlog (our method)** |
 
 ---
-
-## Results (mean across seeds 7, 19, 42 — 500 tasks each)
-
-| Policy | Avg Latency | P95 Latency | Avg Energy | Violations |
-|---|---|---|---|---|
-| edge_only | 1.351 s | 3.584 s | 0.276 J | 41.7 % |
-| cloud_only | 0.910 s | 2.506 s | 1.000 J | 19.9 % |
-| threshold | 0.593 s | 2.457 s | 0.559 J | 14.2 % |
-| reactive | 0.573 s | 1.664 s | 0.368 J | 6.67 % |
-| **predictive** | **0.564 s** | **1.609 s** | 0.372 J | **6.33 %** |
-
-**Predictive vs Reactive:** −5.0 % deadline violations, −1.6 % average latency.
 
 ### Why not raw forecast MAE?
 
