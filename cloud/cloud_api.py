@@ -9,9 +9,9 @@ from shared.data_models import ExecutionResult, IoTTask
 
 
 class CloudAPI:
-    CLOUD_URL = "http://13.53.132.84:8000/execute_task"
+    CLOUD_URL = "http://98.70.25.204:8000/execute_task"
 
-    def __init__(self, use_remote: bool = True):
+    def __init__(self, use_remote: bool = False):
         self.use_remote = use_remote
         self._fallback = CloudExecutor()
 

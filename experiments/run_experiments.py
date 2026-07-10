@@ -1,20 +1,32 @@
 """
 run_experiments.py
 ==================
-Five-policy benchmark — Smart Edge Offload framework.
+Seven-policy benchmark — Smart Edge Offload framework.
 
 Policies
 --------
-edge_only   — always local
-cloud_only  — always cloud
-threshold   — rule: backlog > 0.9s or size > 5.5 MB → cloud
-reactive    — cost function with current observed backlog
-predictive  — cost function with Holt-Winters forecast  ← our method
+edge_only          — always local
+cloud_only         — always cloud
+threshold          — rule: backlog > 0.9s or size > 5.5 MB -> cloud
+reactive           — cost function with current observed backlog
+naive_persistence  — cost function with next-slot = last-observed forecast (ablation control)
+arima              — cost function with a low-order ARIMA(1,1,0) forecast   (ablation / R3 comparison)
+predictive         — cost function with Holt-Winters forecast  <- our method
+
+naive_persistence and arima use the *identical* DecisionEngine and cost
+function as "predictive" - only the forecaster feeding the engine differs.
+This isolates the Holt-Winters component's contribution from "any forecaster"
+(reviewer-requested ablation), and gives a classical-method comparison point
+(reviewer-requested ARIMA baseline).
 
 To use real cloud server
 ------------------------
 Change ONE line:  USE_REAL_CLOUD = True
-That's it. Everything else stays the same.
+That's it. Everything else stays the same. Note: estimate() (used for every
+routing decision) never touches the network - only execute() does, with a
+graceful fallback to the local simulation model if the request fails/times
+out. So even with USE_REAL_CLOUD=True this script can never crash due to
+network issues; it will just fall back silently per task.
 """
 
 from __future__ import annotations
@@ -35,7 +47,12 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from cloud.cloud_api import CloudAPI
 from cloud.executor import CloudExecutor
-from edge.congestion_predictor import CongestionPredictor
+from edge.congestion_predictor import (
+    ARIMAPredictor,
+    CongestionPredictor,
+    NaivePersistencePredictor,
+    SimpleExpSmoothingPredictor,
+)
 from edge.decision_engine import DecisionEngine
 from edge.edge_executor import EdgeExecutor
 from simulator.device_simulator import IoTSimulator
@@ -43,38 +60,51 @@ from simulator.device_simulator import IoTSimulator
 # ─────────────────────────── configuration ───────────────────────────────────
 TARGET_TASKS   = 500
 SLOT_SECONDS   = 0.35
-POLICIES       = ["edge_only", "cloud_only", "threshold", "reactive", "predictive"]
-USE_REAL_CLOUD = True        # ← change to True to hit real server at 13.53.132.84
-SEEDS          = [7, 19, 42]
-PRINT_EVERY_NTH = 50
+POLICIES       = [
+    "edge_only", "cloud_only", "threshold", "reactive",
+    "naive_persistence", "arima", "predictive",
+]
+USE_REAL_CLOUD = False      # ← set to False to skip the network round-trip (pure simulation)
+# Expanded from 3 to 15 seeds so per-seed differences (Table II) can support
+# a paired significance test (see significance_test() below) rather than only
+# a qualitative "consistent direction" claim. The original 3 seeds (7, 19, 42)
+# are kept as the first three entries so old per-seed results are a subset.
+SEEDS          = [7, 19, 42, 101, 123, 256, 314, 500, 613, 728, 841, 955, 1001, 1122, 1337]
+PRINT_EVERY_NTH = 100
 
 # ─────────────────────────── colour palette ──────────────────────────────────
 C = {
-    "edge_only":  "#0F766E",
-    "cloud_only": "#B45309",
-    "threshold":  "#4F46E5",
-    "reactive":   "#DC2626",
-    "predictive": "#2563EB",
-    "hw":         "#2563EB",
-    "naive":      "#94A3B8",
-    "grid":       "#E2E8F0",
-    "bg":         "#F8FAFC",
+    "edge_only":         "#0F766E",
+    "cloud_only":        "#B45309",
+    "threshold":         "#4F46E5",
+    "reactive":          "#26DC4E",
+    "naive_persistence": "#B894AD",
+    "arima":             "#7C3AED",
+    "predictive":        "#CF994F",
+    "hw":                "#04060B",
+    "naive":             "#654765",
+    "grid":              "#E2E8F0",
+    "bg":                "#F8FAFC",
 }
 
 LABELS = {
-    "edge_only":  "Edge Only",
-    "cloud_only": "Cloud Only",
-    "threshold":  "Threshold",
-    "reactive":   "Reactive",
-    "predictive": "Predictive (HW)",
+    "edge_only":         "Edge Only",
+    "cloud_only":        "Cloud Only",
+    "threshold":         "Threshold",
+    "reactive":          "Reactive",
+    "naive_persistence": "Naive Persistence",
+    "arima":             "ARIMA(1,1,0)",
+    "predictive":        "Predictive (HW)",
 }
 
 MARKERS = {
-    "edge_only":  "s",
-    "cloud_only": "^",
-    "threshold":  "D",
-    "reactive":   "o",
-    "predictive": "*",
+    "edge_only":         "s",
+    "cloud_only":        "^",
+    "threshold":         "D",
+    "reactive":          "o",
+    "naive_persistence": "v",
+    "arima":             "P",
+    "predictive":        "*",
 }
 
 
@@ -89,10 +119,17 @@ def sample_arrival_rate(slot_idx: int, burst_slots_remaining: int) -> float:
     return max(0.7, base + diurnal + burst)
 
 
-def sample_network(rng: np.random.Generator, bursty: bool) -> tuple[float, float]:
+def sample_network(
+    rng: np.random.Generator,
+    bursty: bool,
+    normal_range: tuple[float, float] = (40.0, 110.0),
+    degraded_range: tuple[float, float] = (18.0, 36.0),
+    rtt_normal_range: tuple[float, float] = (0.025, 0.055),
+    rtt_degraded_range: tuple[float, float] = (0.055, 0.090),
+) -> tuple[float, float]:
     if bursty:
-        return float(rng.uniform(18.0, 36.0)), float(rng.uniform(0.055, 0.090))
-    return float(rng.uniform(40.0, 110.0)), float(rng.uniform(0.025, 0.055))
+        return float(rng.uniform(*degraded_range)), float(rng.uniform(*rtt_degraded_range))
+    return float(rng.uniform(*normal_range)), float(rng.uniform(*rtt_normal_range))
 
 
 def init_metrics() -> dict:
@@ -103,6 +140,12 @@ def init_metrics() -> dict:
         "task_latencies": [],   # per-task for line graphs
         "task_energies":  [],
         "cumulative_violations": [],
+        # Burst-vs-calm breakdown (tests the paper's actual claimed
+        # mechanism - that the predictive policy's advantage should be
+        # concentrated in/around burst periods, where there is congestion
+        # to anticipate, rather than uniform across all conditions).
+        "burst_tasks": 0, "burst_violations": 0, "burst_latencies": [],
+        "calm_tasks": 0, "calm_violations": 0, "calm_latencies": [],
     }
 
 
@@ -152,13 +195,38 @@ def choose_policy(
 #  Single policy run
 # ═══════════════════════════════════════════════════════════════════════════
 
-def run_policy(policy: str, seed: int) -> dict:
+def run_policy(
+    policy: str,
+    seed: int,
+    decision_engine: DecisionEngine | None = None,
+    hw_predictor: CongestionPredictor | None = None,
+    burst_prob: float = 0.12,
+    burst_duration_range: tuple[int, int] = (7, 13),
+    network_normal_range: tuple[float, float] = (40.0, 110.0),
+    network_degraded_range: tuple[float, float] = (18.0, 36.0),
+    rtt_normal_range: tuple[float, float] = (0.025, 0.055),
+    rtt_degraded_range: tuple[float, float] = (0.055, 0.090),
+) -> dict:
+    """
+    Run one (policy, seed) simulation.
+
+    `decision_engine` and `hw_predictor` can be injected with custom
+    hyperparameters (used by sensitivity_sweep.py) - if omitted, the paper's
+    default configuration is used. `burst_*`/`network_*`/`rtt_*` ranges can be
+    widened to construct a stress-test scenario (used by stress_test.py)
+    without duplicating this function.
+    """
     rng             = np.random.default_rng(seed)
     task_simulator  = IoTSimulator(seed=seed)
     edge_executor   = EdgeExecutor()
     cloud_executor  = CloudAPI(use_remote=USE_REAL_CLOUD)
-    decision_engine = DecisionEngine()
-    predictor       = CongestionPredictor()
+    decision_engine = decision_engine or DecisionEngine()
+    hw_predictor    = hw_predictor or CongestionPredictor(verbose_init=False)
+    naive_predictor = NaivePersistencePredictor()
+    # ARIMA refitting is the expensive step - only instantiate/fit it when the
+    # policy under test actually needs it, so the other six policies are not
+    # slowed down by a forecaster they don't use.
+    arima_predictor = ARIMAPredictor() if policy == "arima" else None
     metrics         = init_metrics()
 
     edge_backlog  = 0.0
@@ -170,6 +238,7 @@ def run_policy(policy: str, seed: int) -> dict:
     recent_cloud_service = [0.08]
     edge_pred_errors, edge_naive_errors   = [], []
     cloud_pred_errors, cloud_naive_errors = [], []
+    arima_pred_errors, arima_naive_errors = [], []
     burst_slots_remaining = 0
     slot_idx = 0
 
@@ -177,12 +246,16 @@ def run_policy(policy: str, seed: int) -> dict:
         edge_backlog  = max(0.0, edge_backlog  - SLOT_SECONDS)
         cloud_backlog = max(0.0, cloud_backlog - SLOT_SECONDS)
 
-        if burst_slots_remaining == 0 and rng.random() < 0.12:
-            burst_slots_remaining = int(rng.integers(7, 13))
+        if burst_slots_remaining == 0 and rng.random() < burst_prob:
+            burst_slots_remaining = int(rng.integers(*burst_duration_range))
 
         arrival_rate = sample_arrival_rate(slot_idx, burst_slots_remaining)
         bursty       = burst_slots_remaining > 0
-        bw, rtt      = sample_network(rng, bursty)
+        bw, rtt      = sample_network(
+            rng, bursty,
+            normal_range=network_normal_range, degraded_range=network_degraded_range,
+            rtt_normal_range=rtt_normal_range, rtt_degraded_range=rtt_degraded_range,
+        )
         arrivals     = min(
             int(rng.poisson(arrival_rate * SLOT_SECONDS)),
             TARGET_TASKS - metrics["tasks"],
@@ -190,11 +263,28 @@ def run_policy(policy: str, seed: int) -> dict:
 
         mean_edge_svc   = float(np.mean(recent_edge_service))
         mean_cloud_svc  = float(np.mean(recent_cloud_service))
-        pred_arr        = predictor.predict_congestion(arrival_history,  silent=True)
-        pred_edge_bl    = predictor.predict_congestion(edge_history,  silent=True) + 0.65 * pred_arr * mean_edge_svc
-        pred_cloud_bl   = predictor.predict_congestion(cloud_history, silent=True) + 0.35 * pred_arr * mean_cloud_svc
-        naive_edge_bl   = edge_history[-1]
-        naive_cloud_bl  = cloud_history[-1]
+        pred_arr        = hw_predictor.predict_congestion(arrival_history,  silent=True)
+        pred_edge_bl    = hw_predictor.predict_congestion(edge_history,  silent=True) + 0.65 * pred_arr * mean_edge_svc
+        pred_cloud_bl   = hw_predictor.predict_congestion(cloud_history, silent=True) + 0.35 * pred_arr * mean_cloud_svc
+        naive_edge_bl   = naive_predictor.predict_congestion(edge_history,  silent=True)
+        naive_cloud_bl  = naive_predictor.predict_congestion(cloud_history, silent=True)
+
+        if policy == "arima":
+            arima_edge_bl  = arima_predictor.predict_congestion(edge_history,  silent=True)
+            arima_cloud_bl = arima_predictor.predict_congestion(cloud_history, silent=True)
+        else:
+            arima_edge_bl, arima_cloud_bl = naive_edge_bl, naive_cloud_bl  # unused for other policies
+
+        # Select which forecast feeds the decision engine for this policy.
+        # naive_persistence / arima run through the *same* DecisionEngine and
+        # cost function as predictive - only the forecaster differs, which is
+        # what isolates the Holt-Winters component's contribution.
+        if policy == "naive_persistence":
+            active_pred_edge, active_pred_cloud = naive_edge_bl, naive_cloud_bl
+        elif policy == "arima":
+            active_pred_edge, active_pred_cloud = arima_edge_bl, arima_cloud_bl
+        else:
+            active_pred_edge, active_pred_cloud = pred_edge_bl, pred_cloud_bl
 
         for _ in range(arrivals):
             task = task_simulator.generate_task()
@@ -205,8 +295,8 @@ def run_policy(policy: str, seed: int) -> dict:
                 cloud_executor=cloud_executor,
                 current_edge_backlog=edge_backlog,
                 current_cloud_backlog=cloud_backlog,
-                predicted_edge_backlog=pred_edge_bl,
-                predicted_cloud_backlog=pred_cloud_bl,
+                predicted_edge_backlog=active_pred_edge,
+                predicted_cloud_backlog=active_pred_cloud,
                 bandwidth_mbps=bw, rtt=rtt,
             )
 
@@ -236,6 +326,23 @@ def run_policy(policy: str, seed: int) -> dict:
                 metrics["violations"] += 1
             metrics["cumulative_violations"].append(metrics["violations"])
 
+            # Burst-vs-calm tagging: `bursty` reflects whether *this slot*
+            # (i.e. the slot this task arrived in) was in an active burst
+            # window. This lets us check whether the predictive policy's
+            # advantage is concentrated where the paper's mechanism says it
+            # should be, rather than only looking at an overall average that
+            # blends ~88% calm slots with ~12% burst slots together.
+            if bursty:
+                metrics["burst_tasks"] += 1
+                metrics["burst_latencies"].append(result.execution_time)
+                if violated:
+                    metrics["burst_violations"] += 1
+            else:
+                metrics["calm_tasks"] += 1
+                metrics["calm_latencies"].append(result.execution_time)
+                if violated:
+                    metrics["calm_violations"] += 1
+
             if metrics["tasks"] % PRINT_EVERY_NTH == 0:
                 print(
                     f"  [seed={seed} {policy:<11} task={metrics['tasks']:03d}] "
@@ -250,6 +357,9 @@ def run_policy(policy: str, seed: int) -> dict:
         edge_naive_errors.append(abs(naive_edge_bl - edge_backlog))
         cloud_pred_errors.append(abs(pred_cloud_bl  - cloud_backlog))
         cloud_naive_errors.append(abs(naive_cloud_bl - cloud_backlog))
+        if policy == "arima":
+            arima_pred_errors.append(abs(arima_edge_bl - edge_backlog))
+            arima_naive_errors.append(abs(naive_edge_bl - edge_backlog))
         edge_history.append(edge_backlog)
         cloud_history.append(cloud_backlog)
         arrival_history.append(float(arrivals))
@@ -272,6 +382,23 @@ def run_policy(policy: str, seed: int) -> dict:
         "edge_naive_mae":    float(np.mean(edge_naive_errors)),
         "cloud_pred_mae":    float(np.mean(cloud_pred_errors)),
         "cloud_naive_mae":   float(np.mean(cloud_naive_errors)),
+        # Only populated when policy == "arima" (0.0 otherwise) - ARIMA is
+        # only fit for its own policy run to avoid slowing down the others.
+        "arima_pred_mae":    float(np.mean(arima_pred_errors)) if arima_pred_errors else 0.0,
+        "arima_naive_mae":   float(np.mean(arima_naive_errors)) if arima_naive_errors else 0.0,
+        # Burst-vs-calm breakdown (tests whether the advantage is concentrated
+        # where the anticipatory mechanism is designed to act). NaN if a
+        # given seed happened to produce zero tasks in that condition.
+        "burst_tasks":         metrics["burst_tasks"],
+        "burst_violation_pct": (100.0 * metrics["burst_violations"] / metrics["burst_tasks"]
+                                 if metrics["burst_tasks"] else float("nan")),
+        "burst_avg_latency":   (float(np.mean(metrics["burst_latencies"]))
+                                 if metrics["burst_latencies"] else float("nan")),
+        "calm_tasks":          metrics["calm_tasks"],
+        "calm_violation_pct":  (100.0 * metrics["calm_violations"] / metrics["calm_tasks"]
+                                 if metrics["calm_tasks"] else float("nan")),
+        "calm_avg_latency":    (float(np.mean(metrics["calm_latencies"]))
+                                 if metrics["calm_latencies"] else float("nan")),
         "edge_trace":        metrics["edge_backlog_trace"],
         "cloud_trace":       metrics["cloud_backlog_trace"],
         "task_latencies":    metrics["task_latencies"],
@@ -288,6 +415,9 @@ SUMMARY_KEYS = [
     "avg_latency", "p95_latency", "avg_energy", "violation_pct",
     "cloud_pct", "avg_edge_backlog", "avg_cloud_backlog",
     "edge_pred_mae", "edge_naive_mae", "cloud_pred_mae", "cloud_naive_mae",
+    "arima_pred_mae", "arima_naive_mae",
+    "burst_violation_pct", "burst_avg_latency",
+    "calm_violation_pct", "calm_avg_latency",
 ]
 
 
@@ -301,10 +431,131 @@ def aggregate_results(rows: list[dict]) -> list[dict]:
         record  = {"policy": policy, "n_seeds": len(entries)}
         for key in SUMMARY_KEYS:
             vals = [r[key] for r in entries]
-            record[key]          = float(np.mean(vals))
-            record[key + "_std"] = float(np.std(vals, ddof=0))
+            # nanmean/nanstd: burst_/calm_ fields can be NaN for a seed that
+            # happened to produce zero tasks in that condition (rare, but
+            # possible for short runs) - skip those rather than propagating
+            # NaN into the whole summary.
+            record[key]          = float(np.nanmean(vals))
+            record[key + "_std"] = float(np.nanstd(vals, ddof=0))
+        record["total_burst_tasks"] = int(sum(r["burst_tasks"] for r in entries))
+        record["total_calm_tasks"]  = int(sum(r["calm_tasks"] for r in entries))
         summary.append(record)
     return summary
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Paired significance testing (Reviewer 2, statistical-rigor ask)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def significance_test(all_rows: list[dict], metric: str, policy_a: str, policy_b: str) -> dict:
+    """
+    Paired comparison of `metric` between policy_a and policy_b across the
+    *same* seeds (so it's a proper paired test, not an independent-samples
+    test - both policies see identical workload/burst/network draws for a
+    given seed). Reports both a paired t-test (parametric) and a Wilcoxon
+    signed-rank test (non-parametric, robust to the small/non-normal sample),
+    plus a 95% CI on the mean paired difference via the t-distribution.
+
+    Requires scipy; if unavailable, falls back to reporting only the paired
+    differences without p-values (still useful, just not a formal test).
+    """
+    rows_a = {r["seed"]: r[metric] for r in all_rows if r["policy"] == policy_a}
+    rows_b = {r["seed"]: r[metric] for r in all_rows if r["policy"] == policy_b}
+    common_seeds = sorted(set(rows_a) & set(rows_b))
+    a = np.array([rows_a[s] for s in common_seeds])
+    b = np.array([rows_b[s] for s in common_seeds])
+    # Drop seed-pairs where either side is NaN (e.g. a seed with zero burst
+    # tasks for the burst-conditional metrics) so they don't poison the test.
+    valid = ~(np.isnan(a) | np.isnan(b))
+    a, b = a[valid], b[valid]
+    diff = a - b  # positive => policy_a has the larger value
+    n = len(diff)
+
+    result = {
+        "metric": metric, "policy_a": policy_a, "policy_b": policy_b,
+        "n_seeds": n,
+        "mean_diff": float(np.mean(diff)) if n else float("nan"),
+        "std_diff": float(np.std(diff, ddof=1)) if n > 1 else float("nan"),
+        "wins_a_over_b": int(np.sum(diff < 0)),  # a "wins" when its value is lower (fewer violations/lower latency)
+        "ties": int(np.sum(diff == 0)),
+        "n": n,
+    }
+
+    try:
+        from scipy import stats
+        if n > 1:
+            t_stat, t_p = stats.ttest_rel(a, b)
+            result["t_stat"] = float(t_stat)
+            result["t_pvalue"] = float(t_p)
+            se = result["std_diff"] / np.sqrt(n)
+            tcrit = stats.t.ppf(0.975, df=n - 1)
+            result["ci95_low"] = result["mean_diff"] - tcrit * se
+            result["ci95_high"] = result["mean_diff"] + tcrit * se
+        if n > 5 and np.any(diff != 0):
+            w_stat, w_p = stats.wilcoxon(a, b)
+            result["wilcoxon_stat"] = float(w_stat)
+            result["wilcoxon_pvalue"] = float(w_p)
+    except ImportError:
+        result["note"] = "scipy not installed - only paired differences reported, no p-values."
+
+    return result
+
+
+def run_significance_suite(all_rows: list[dict]) -> list[dict]:
+    """Runs the paired comparisons reviewers are most likely to ask about:
+    predictive vs. reactive, predictive vs. naive_persistence (the forecaster
+    ablation), and predictive vs. threshold, on both violation_pct and
+    avg_latency - plus the same comparisons split by burst-vs-calm arrival
+    conditions, which directly tests the paper's claimed mechanism (that the
+    predictive policy's advantage comes from anticipating congestion, and so
+    should be concentrated in/around burst periods rather than uniform)."""
+    comparisons = [
+        ("reactive", "predictive"),
+        ("naive_persistence", "predictive"),
+        ("arima", "predictive"),
+        ("threshold", "predictive"),
+    ]
+    metrics = [
+        "violation_pct", "avg_latency", "avg_energy",
+        "burst_violation_pct", "burst_avg_latency",
+        "calm_violation_pct", "calm_avg_latency",
+    ]
+    results = []
+    for a, b in comparisons:
+        for m in metrics:
+            results.append(significance_test(all_rows, m, a, b))
+    return results
+
+
+def save_significance_csv(sig_rows: list[dict], path: str):
+    fieldnames = sorted({k for r in sig_rows for k in r.keys()})
+    with open(path, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in sig_rows:
+            writer.writerow(row)
+
+
+def print_significance(sig_rows: list[dict]):
+    print("\n" + "=" * 96)
+    print("  PAIRED SIGNIFICANCE TESTS  (policy_a - policy_b, paired across seeds)")
+    print("=" * 96)
+    for r in sig_rows:
+        line = (
+            f"  {r['policy_a']:<18} vs {r['policy_b']:<12} | {r['metric']:<14} "
+            f"n={r['n_seeds']:<3} mean_diff={r['mean_diff']:+.4f}"
+        )
+        if "t_pvalue" in r:
+            line += f"  t_p={r['t_pvalue']:.4f}"
+        if "wilcoxon_pvalue" in r:
+            line += f"  wilcoxon_p={r['wilcoxon_pvalue']:.4f}"
+        if "ci95_low" in r:
+            line += f"  95%CI=[{r['ci95_low']:+.4f}, {r['ci95_high']:+.4f}]"
+        print(line)
+    print("=" * 96)
+    print("  Note: mean_diff = policy_a - policy_b. For violation_pct/avg_latency,")
+    print("  a positive mean_diff means policy_a is WORSE (predictive is policy_b here).")
+    print()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -617,6 +868,35 @@ def print_summary(summary_rows: list[dict]):
     print(f"  Predictive vs Threshold : {dv_t:+.1f}% violations")
     print()
 
+    # ── Burst-vs-calm breakdown ──────────────────────────────────────────
+    # Tests the paper's claimed mechanism directly: the predictive policy is
+    # supposed to help most where there's congestion to anticipate. If its
+    # margin over reactive/naive/arima is bigger in the burst column than in
+    # the calm column, that's direct support for the mechanism - if the
+    # margins look the same in both columns, the advantage isn't actually
+    # coming from anticipating bursts specifically.
+    print("=" * 82)
+    print("  BURST vs CALM BREAKDOWN  (mean ± std across seeds)")
+    print("=" * 82)
+    hdr = (f"  {'Policy':<20} {'BurstViol%':>11} {'BurstLat':>10} "
+           f"{'CalmViol%':>10} {'CalmLat':>9}")
+    print(hdr)
+    print("  " + "-" * 78)
+    for row in summary_rows:
+        print(
+            f"  {row['policy']:<20} "
+            f"{row['burst_violation_pct']:>10.2f}% "
+            f"{row['burst_avg_latency']:>9.3f}s "
+            f"{row['calm_violation_pct']:>9.2f}% "
+            f"{row['calm_avg_latency']:>8.3f}s"
+        )
+    print("  " + "-" * 78)
+    n_burst = summary_rows[0].get("total_burst_tasks", 0)
+    n_calm  = summary_rows[0].get("total_calm_tasks", 0)
+    print(f"  (total tasks pooled across all seeds: {n_burst} burst-slot, {n_calm} calm-slot)")
+    print("=" * 82)
+    print()
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  Entry point
@@ -644,9 +924,13 @@ def main():
     summary_rows = aggregate_results(all_rows)
     print_summary(summary_rows)
 
+    sig_rows = run_significance_suite(all_rows)
+    print_significance(sig_rows)
+
     out_dir = os.path.dirname(os.path.abspath(__file__))
     save_csv(all_rows,     os.path.join(out_dir, "per_seed_results.csv"))
     save_csv(summary_rows, os.path.join(out_dir, "summary_results.csv"))
+    save_significance_csv(sig_rows, os.path.join(out_dir, "significance_results.csv"))
     save_figures(all_rows, summary_rows, out_dir)
 
 

@@ -1,4 +1,5 @@
 statsmodels
+scipy
 psutil
 numpy
 pandas

@@ -13,6 +13,9 @@ class DecisionEngine:
         gamma: float = 0.25,
         offload_margin: float = 0.08,
         uncertainty_weight: float = 0.35,
+        w_rising: float = 0.75,
+        w_easing: float = 0.55,
+        cloud_blend: float = 0.65,
     ):
         assert abs(alpha + beta + gamma - 1.0) < 1e-6, "Weights must sum to 1.0"
         self.alpha = alpha
@@ -20,6 +23,17 @@ class DecisionEngine:
         self.gamma = gamma
         self.offload_margin = offload_margin
         self.uncertainty_weight = uncertainty_weight
+        # Asymmetric edge-backlog blend weights (Eq. 9): w_rising applies when
+        # the forecast exceeds the observed backlog (pre-emptive offload before
+        # a spike); w_easing applies when the forecast is falling (faster
+        # return to edge execution than a reactive policy permits). Exposed as
+        # constructor args so a sensitivity sweep can vary them without
+        # touching this file.
+        self.w_rising = w_rising
+        self.w_easing = w_easing
+        # Cloud-backlog blend weight (Eq. 10): weight on the *predicted*
+        # cloud backlog vs. the observed one.
+        self.cloud_blend = cloud_blend
 
     def _queue_pressure(self, backlog: float, scale: float = 1.0) -> float:
         return 1.0 - math.exp(-max(0.0, backlog) / max(scale, 1e-6))
@@ -106,12 +120,12 @@ class DecisionEngine:
             # weight it strongly so we offload BEFORE the spike hits.
             # If prediction < current, trust it (congestion easing → prefer edge).
             rising = predicted_edge_backlog > current_edge_backlog
-            w_pred = 0.75 if rising else 0.55
+            w_pred = self.w_rising if rising else self.w_easing
             edge_backlog = w_pred * predicted_edge_backlog + (1 - w_pred) * current_edge_backlog
 
         cloud_backlog = current_cloud_backlog
         if predicted_cloud_backlog is not None:
-            cloud_backlog = 0.65 * predicted_cloud_backlog + 0.35 * current_cloud_backlog
+            cloud_backlog = self.cloud_blend * predicted_cloud_backlog + (1 - self.cloud_blend) * current_cloud_backlog
 
         edge_cost, edge_terms = self.compute_cost(task, edge_estimate, edge_backlog)
         cloud_cost, cloud_terms = self.compute_cost(task, cloud_estimate, cloud_backlog)
