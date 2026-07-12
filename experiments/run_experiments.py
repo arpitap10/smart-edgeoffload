@@ -71,6 +71,10 @@ USE_REAL_CLOUD = False      # ← set to False to skip the network round-trip (p
 # are kept as the first three entries so old per-seed results are a subset.
 SEEDS          = [7, 19, 42, 101, 123, 256, 314, 500, 613, 728, 841, 955, 1001, 1122, 1337]
 PRINT_EVERY_NTH = 100
+# Both burst generators (see BurstGenerator) are run and reported side by
+# side - "step" is the original all-or-nothing switch, "ramped" is the new
+# gradual ramp-up/peak/ramp-down model. Neither replaces the other.
+TRAFFIC_MODELS = ["step", "ramped"]
 
 # ─────────────────────────── colour palette ──────────────────────────────────
 C = {
@@ -112,24 +116,148 @@ MARKERS = {
 #  Simulation helpers
 # ═══════════════════════════════════════════════════════════════════════════
 
-def sample_arrival_rate(slot_idx: int, burst_slots_remaining: int) -> float:
+def sample_arrival_rate(slot_idx: int, burst_intensity: float) -> float:
+    """`burst_intensity` in [0, 1]: 0 = calm, 1 = full burst. The "step" traffic
+    model only ever passes 0.0 or 1.0 (all-or-nothing), which reproduces the
+    original behaviour exactly. The "ramped" model passes the smoothly
+    ramping value instead, so the arrival-rate boost rises/falls with it."""
     base    = 1.85
     diurnal = 0.45 * np.sin((2 * np.pi * slot_idx) / 40.0)
-    burst   = 2.2 if burst_slots_remaining > 0 else 0.0
+    burst   = 2.2 * burst_intensity
     return max(0.7, base + diurnal + burst)
 
 
 def sample_network(
     rng: np.random.Generator,
-    bursty: bool,
+    burst_intensity: float,
     normal_range: tuple[float, float] = (40.0, 110.0),
     degraded_range: tuple[float, float] = (18.0, 36.0),
     rtt_normal_range: tuple[float, float] = (0.025, 0.055),
     rtt_degraded_range: tuple[float, float] = (0.055, 0.090),
 ) -> tuple[float, float]:
-    if bursty:
-        return float(rng.uniform(*degraded_range)), float(rng.uniform(*rtt_degraded_range))
-    return float(rng.uniform(*normal_range)), float(rng.uniform(*rtt_normal_range))
+    """`burst_intensity` in [0, 1] interpolates the sampling range's bounds
+    between "normal" and "degraded" - at 0.0 this samples exactly from
+    normal_range/rtt_normal_range, at 1.0 exactly from degraded_range/
+    rtt_degraded_range (identical to the old bursty/not-bursty switch), and
+    at any value in between it samples from a smoothly interpolated range."""
+    t = float(np.clip(burst_intensity, 0.0, 1.0))
+    bw_low   = normal_range[0]     + t * (degraded_range[0]     - normal_range[0])
+    bw_high  = normal_range[1]     + t * (degraded_range[1]     - normal_range[1])
+    rtt_low  = rtt_normal_range[0] + t * (rtt_degraded_range[0] - rtt_normal_range[0])
+    rtt_high = rtt_normal_range[1] + t * (rtt_degraded_range[1] - rtt_normal_range[1])
+    return float(rng.uniform(bw_low, bw_high)), float(rng.uniform(rtt_low, rtt_high))
+
+
+class BurstGenerator:
+    """
+    Slot-by-slot burst driver. Call `.step()` once per slot; it returns this
+    slot's `burst_intensity` in [0, 1] (0 = calm, 1 = full severity) and
+    updates `.active` (used for the burst-vs-calm metrics tagging).
+
+    Two interchangeable models, selected via `traffic_model`:
+
+    "step"   - the original all-or-nothing generator. While calm, each slot
+               independently starts a burst with probability `burst_prob`.
+               Once triggered, the burst instantly jumps to full intensity
+               (1.0) for a duration drawn from `burst_duration_range`, then
+               instantly drops back to 0.0.
+
+    "ramped" - same random per-slot trigger (`burst_prob`) while calm, so
+               *when* a burst starts is exactly as unpredictable as before.
+               Once triggered, intensity is no longer an instant switch: it
+               ramps 0.0 -> 1.0 linearly over a duration drawn from
+               `ramp_up_range`, holds at 1.0 for a duration drawn from
+               `peak_range`, then ramps 1.0 -> 0.0 linearly over a duration
+               drawn from `ramp_down_range`. This single intensity value is
+               what feeds both the arrival-rate boost (sample_arrival_rate)
+               and the bandwidth/RTT degradation (sample_network) - so the
+               whole burst (traffic and network) rises and falls together.
+
+    Both models are driven by the same `rng`, so pass `traffic_model` as a
+    parameter (not a permanent replacement) to run the identical experiment
+    suite under each and compare policies side by side.
+    """
+
+    def __init__(
+        self,
+        rng: np.random.Generator,
+        traffic_model: str = "step",
+        burst_prob: float = 0.12,
+        burst_duration_range: tuple[int, int] = (7, 13),
+        ramp_up_range: tuple[int, int] = (3, 5),
+        peak_range: tuple[int, int] = (5, 10),
+        ramp_down_range: tuple[int, int] = (3, 5),
+    ):
+        if traffic_model not in ("step", "ramped"):
+            raise ValueError(f"traffic_model must be 'step' or 'ramped', got {traffic_model!r}")
+        self.rng                  = rng
+        self.traffic_model        = traffic_model
+        self.burst_prob           = burst_prob
+        self.burst_duration_range = burst_duration_range
+        self.ramp_up_range        = ramp_up_range
+        self.peak_range           = peak_range
+        self.ramp_down_range      = ramp_down_range
+
+        # "step" model state
+        self._step_remaining = 0
+
+        # "ramped" model state
+        self._phase         = "calm"   # calm -> ramp_up -> peak -> ramp_down -> calm
+        self._phase_len      = 0
+        self._phase_elapsed  = 0
+
+    @property
+    def active(self) -> bool:
+        """Whether *this* slot counts as a burst slot for burst-vs-calm tagging."""
+        if self.traffic_model == "step":
+            return self._step_remaining > 0
+        return self._phase != "calm"
+
+    def step(self) -> float:
+        """Advance one slot (rolling for a new burst if currently calm) and
+        return this slot's burst_intensity in [0, 1]."""
+        if self.traffic_model == "step":
+            return self._step_slot()
+        return self._ramped_slot()
+
+    def _step_slot(self) -> float:
+        if self._step_remaining == 0 and self.rng.random() < self.burst_prob:
+            self._step_remaining = int(self.rng.integers(*self.burst_duration_range))
+        intensity = 1.0 if self._step_remaining > 0 else 0.0
+        self._step_remaining = max(0, self._step_remaining - 1)
+        return intensity
+
+    def _ramped_slot(self) -> float:
+        if self._phase == "calm":
+            if self.rng.random() < self.burst_prob:
+                self._phase        = "ramp_up"
+                self._phase_len    = int(self.rng.integers(*self.ramp_up_range))
+                self._phase_elapsed = 0
+            else:
+                return 0.0
+
+        if self._phase == "ramp_up":
+            intensity = (self._phase_elapsed + 1) / self._phase_len
+        elif self._phase == "peak":
+            intensity = 1.0
+        else:  # ramp_down
+            intensity = 1.0 - (self._phase_elapsed + 1) / self._phase_len
+        intensity = float(np.clip(intensity, 0.0, 1.0))
+
+        self._phase_elapsed += 1
+        if self._phase_elapsed >= self._phase_len:
+            if self._phase == "ramp_up":
+                self._phase     = "peak"
+                self._phase_len = int(self.rng.integers(*self.peak_range))
+            elif self._phase == "peak":
+                self._phase     = "ramp_down"
+                self._phase_len = int(self.rng.integers(*self.ramp_down_range))
+            else:  # ramp_down finished
+                self._phase     = "calm"
+                self._phase_len = 0
+            self._phase_elapsed = 0
+
+        return intensity
 
 
 def init_metrics() -> dict:
@@ -200,8 +328,12 @@ def run_policy(
     seed: int,
     decision_engine: DecisionEngine | None = None,
     hw_predictor: CongestionPredictor | None = None,
+    traffic_model: str = "step",
     burst_prob: float = 0.12,
     burst_duration_range: tuple[int, int] = (7, 13),
+    ramp_up_range: tuple[int, int] = (3, 5),
+    peak_range: tuple[int, int] = (5, 10),
+    ramp_down_range: tuple[int, int] = (3, 5),
     network_normal_range: tuple[float, float] = (40.0, 110.0),
     network_degraded_range: tuple[float, float] = (18.0, 36.0),
     rtt_normal_range: tuple[float, float] = (0.025, 0.055),
@@ -215,6 +347,15 @@ def run_policy(
     default configuration is used. `burst_*`/`network_*`/`rtt_*` ranges can be
     widened to construct a stress-test scenario (used by stress_test.py)
     without duplicating this function.
+
+    `traffic_model` selects the burst generator (see `BurstGenerator`):
+      "step"   - (default) original all-or-nothing burst switch, using
+                 `burst_prob` / `burst_duration_range`.
+      "ramped" - same random per-slot trigger probability, but the burst
+                 ramps up / holds / ramps down smoothly, using `burst_prob` /
+                 `ramp_up_range` / `peak_range` / `ramp_down_range`.
+    Pass this as a parameter to run the same (policy, seed) suite under both
+    models and compare side by side - it does not replace "step".
     """
     rng             = np.random.default_rng(seed)
     task_simulator  = IoTSimulator(seed=seed)
@@ -239,20 +380,23 @@ def run_policy(
     edge_pred_errors, edge_naive_errors   = [], []
     cloud_pred_errors, cloud_naive_errors = [], []
     arima_pred_errors, arima_naive_errors = [], []
-    burst_slots_remaining = 0
+    burst_gen = BurstGenerator(
+        rng, traffic_model=traffic_model, burst_prob=burst_prob,
+        burst_duration_range=burst_duration_range,
+        ramp_up_range=ramp_up_range, peak_range=peak_range, ramp_down_range=ramp_down_range,
+    )
     slot_idx = 0
 
     while metrics["tasks"] < TARGET_TASKS:
         edge_backlog  = max(0.0, edge_backlog  - SLOT_SECONDS)
         cloud_backlog = max(0.0, cloud_backlog - SLOT_SECONDS)
 
-        if burst_slots_remaining == 0 and rng.random() < burst_prob:
-            burst_slots_remaining = int(rng.integers(*burst_duration_range))
+        burst_intensity = burst_gen.step()
+        bursty          = burst_gen.active
 
-        arrival_rate = sample_arrival_rate(slot_idx, burst_slots_remaining)
-        bursty       = burst_slots_remaining > 0
+        arrival_rate = sample_arrival_rate(slot_idx, burst_intensity)
         bw, rtt      = sample_network(
-            rng, bursty,
+            rng, burst_intensity,
             normal_range=network_normal_range, degraded_range=network_degraded_range,
             rtt_normal_range=rtt_normal_range, rtt_degraded_range=rtt_degraded_range,
         )
@@ -363,12 +507,12 @@ def run_policy(
         edge_history.append(edge_backlog)
         cloud_history.append(cloud_backlog)
         arrival_history.append(float(arrivals))
-        burst_slots_remaining = max(0, burst_slots_remaining - 1)
         slot_idx += 1
 
     return {
         "policy":            policy,
         "seed":              seed,
+        "traffic_model":     traffic_model,
         "tasks":             metrics["tasks"],
         "edge_pct":          100.0 * metrics["edge_count"]  / metrics["tasks"],
         "cloud_pct":         100.0 * metrics["cloud_count"] / metrics["tasks"],
@@ -428,7 +572,11 @@ def aggregate_results(rows: list[dict]) -> list[dict]:
     summary = []
     for policy in POLICIES:
         entries = grouped[policy]
-        record  = {"policy": policy, "n_seeds": len(entries)}
+        record  = {
+            "policy": policy,
+            "traffic_model": entries[0]["traffic_model"] if entries else "unknown",
+            "n_seeds": len(entries),
+        }
         for key in SUMMARY_KEYS:
             vals = [r[key] for r in entries]
             # nanmean/nanstd: burst_/calm_ fields can be NaN for a seed that
@@ -902,36 +1050,158 @@ def print_summary(summary_rows: list[dict]):
 #  Entry point
 # ═══════════════════════════════════════════════════════════════════════════
 
-def main():
-    print("\n" + "=" * 82)
-    print("  Smart Edge Offload — Experiment Runner")
-    print(f"  Policies : {POLICIES}")
-    print(f"  Seeds    : {SEEDS}  ({'real cloud server' if USE_REAL_CLOUD else 'simulation mode'})")
-    print(f"  Tasks    : {TARGET_TASKS} per run")
-    print("=" * 82)
+# ═══════════════════════════════════════════════════════════════════════════
+#  Step vs. Ramped comparison (side-by-side across all policies)
+# ═══════════════════════════════════════════════════════════════════════════
 
+def run_full_suite(traffic_model: str, seeds: list[int] = None, policies: list[str] = None) -> list[dict]:
+    """Runs every (policy, seed) combination under a single traffic_model and
+    returns the flat list of per-run result dicts (each tagged with
+    traffic_model). This is the same loop main() used to run once for
+    "step" only - now it's reusable so main() can call it once per model."""
+    seeds    = seeds    or SEEDS
+    policies = policies or POLICIES
     all_rows = []
-    for seed in SEEDS:
-        print(f"\n[Seed {seed}]")
-        for policy in POLICIES:
+    for seed in seeds:
+        print(f"\n[traffic_model={traffic_model} seed={seed}]")
+        for policy in policies:
             print(f"  Running {policy} …")
-            row = run_policy(policy, seed)
+            row = run_policy(policy, seed, traffic_model=traffic_model)
             all_rows.append(row)
             print(f"  → latency={row['avg_latency']:.3f}s  "
                   f"viol={row['violation_pct']:.2f}%  "
                   f"cloud={row['cloud_pct']:.1f}%")
+    return all_rows
 
-    summary_rows = aggregate_results(all_rows)
-    print_summary(summary_rows)
 
-    sig_rows = run_significance_suite(all_rows)
-    print_significance(sig_rows)
+def print_traffic_model_comparison(summary_by_model: dict[str, list[dict]]):
+    """Console table: every policy's headline metrics under "step" vs
+    "ramped", side by side, so neither model is picked over the other."""
+    print("\n" + "=" * 100)
+    print("  STEP vs RAMPED — ALL POLICIES  (mean across seeds)")
+    print("=" * 100)
+    hdr = (f"  {'Policy':<20} {'Model':<8} {'AvgLat':>8} {'Viol%':>7} "
+           f"{'Cloud%':>7} {'BurstViol%':>11} {'BurstLat':>9}")
+    print(hdr)
+    print("  " + "-" * 92)
+    for policy in POLICIES:
+        for model in TRAFFIC_MODELS:
+            row = next(r for r in summary_by_model[model] if r["policy"] == policy)
+            print(
+                f"  {policy:<20} {model:<8} "
+                f"{row['avg_latency']:>7.3f}s "
+                f"{row['violation_pct']:>6.2f}% "
+                f"{row['cloud_pct']:>6.1f}% "
+                f"{row['burst_violation_pct']:>10.2f}% "
+                f"{row['burst_avg_latency']:>8.3f}s"
+            )
+        print("  " + "-" * 92)
+    print("=" * 100)
+    print()
+
+
+def save_traffic_model_comparison_figure(summary_by_model: dict[str, list[dict]], out_dir: str):
+    """Bar chart mirroring stress_test.py's normal-vs-stress comparison, but
+    for step vs. ramped across all seven policies on the metrics most
+    relevant to whether predictive forecasting still helps: overall
+    violation rate, overall latency, and the burst-conditional violation
+    rate (where the anticipatory mechanism is supposed to act)."""
+    policies = POLICIES
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    fig.patch.set_facecolor("white")
+
+    x = np.arange(len(policies))
+    width = 0.35
+
+    panels = [
+        ("violation_pct",       "Deadline Violations (%)"),
+        ("avg_latency",         "Average Latency (s)"),
+        ("burst_violation_pct", "Burst-Slot Deadline Violations (%)"),
+    ]
+    for ax, (key, ylabel) in zip(axes, panels):
+        for i, model in enumerate(TRAFFIC_MODELS):
+            rows = summary_by_model[model]
+            vals = [next(r[key] for r in rows if r["policy"] == p) for p in policies]
+            errs = [next(r[key + "_std"] for r in rows if r["policy"] == p) for p in policies]
+            offset = (i - 0.5) * width
+            ax.bar(x + offset, vals, width, yerr=errs, capsize=3,
+                   label=model, alpha=0.9 if model == "step" else 1.0,
+                   color="#94A3B8" if model == "step" else "#0F766E")
+        ax.set_xticks(x)
+        ax.set_xticklabels([LABELS[p] for p in policies], rotation=25, ha="right", fontsize=8)
+        ax.set_ylabel(ylabel)
+        ax.set_title(ylabel, fontsize=10)
+        ax.legend(fontsize=8)
+        ax.grid(True, ls="--", alpha=0.4, axis="y")
+
+    fig.suptitle(
+        "Traffic Model Comparison: step (all-or-nothing burst) vs. "
+        "ramped (gradual ramp-up/peak/ramp-down burst) — all 7 policies",
+        fontsize=11, fontweight="bold",
+    )
+    fig.tight_layout()
+    _savefig(fig, out_dir, "fig_traffic_model_comparison.png")
+
+
+def save_traffic_model_comparison_csv(summary_by_model: dict[str, list[dict]], path: str):
+    rows = [r for model in TRAFFIC_MODELS for r in summary_by_model[model]]
+    save_csv(rows, path)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Entry point
+# ═══════════════════════════════════════════════════════════════════════════
+
+def main():
+    print("\n" + "=" * 82)
+    print("  Smart Edge Offload — Experiment Runner")
+    print(f"  Policies       : {POLICIES}")
+    print(f"  Seeds          : {SEEDS}  ({'real cloud server' if USE_REAL_CLOUD else 'simulation mode'})")
+    print(f"  Tasks per run  : {TARGET_TASKS}")
+    print(f"  Traffic models : {TRAFFIC_MODELS}  (both run in full, reported side by side)")
+    print("=" * 82)
 
     out_dir = os.path.dirname(os.path.abspath(__file__))
-    save_csv(all_rows,     os.path.join(out_dir, "per_seed_results.csv"))
-    save_csv(summary_rows, os.path.join(out_dir, "summary_results.csv"))
-    save_significance_csv(sig_rows, os.path.join(out_dir, "significance_results.csv"))
-    save_figures(all_rows, summary_rows, out_dir)
+
+    all_rows_by_model = {}
+    summary_by_model  = {}
+
+    for model in TRAFFIC_MODELS:
+        model_dir = os.path.join(out_dir, model)
+        os.makedirs(model_dir, exist_ok=True)
+
+        all_rows = run_full_suite(model)
+        all_rows_by_model[model] = all_rows
+
+        summary_rows = aggregate_results(all_rows)
+        summary_by_model[model] = summary_rows
+        print(f"\n{'#' * 82}\n#  RESULTS FOR traffic_model={model}\n{'#' * 82}")
+        print_summary(summary_rows)
+
+        sig_rows = run_significance_suite(all_rows)
+        print_significance(sig_rows)
+
+        # Per-model outputs go in their own subfolder (fig1..fig8 etc, exactly
+        # the same breakdown the paper already had) so "step" and "ramped"
+        # never overwrite each other.
+        save_csv(all_rows,     os.path.join(model_dir, "per_seed_results.csv"))
+        save_csv(summary_rows, os.path.join(model_dir, "summary_results.csv"))
+        save_significance_csv(sig_rows, os.path.join(model_dir, "significance_results.csv"))
+        save_figures(all_rows, summary_rows, model_dir)
+
+    # ── Side-by-side comparison across both models (the actual ask: report
+    #    both, don't pick one) ────────────────────────────────────────────
+    print_traffic_model_comparison(summary_by_model)
+    save_traffic_model_comparison_csv(
+        summary_by_model, os.path.join(out_dir, "traffic_model_comparison_summary.csv")
+    )
+    combined_all_rows = [row for model in TRAFFIC_MODELS for row in all_rows_by_model[model]]
+    save_csv(combined_all_rows, os.path.join(out_dir, "traffic_model_comparison_per_seed.csv"))
+    save_traffic_model_comparison_figure(summary_by_model, out_dir)
+
+    print("\n  Done. Per-model breakdown in step/ and ramped/ subfolders;")
+    print("  side-by-side comparison in traffic_model_comparison_summary.csv,")
+    print("  traffic_model_comparison_per_seed.csv, and fig_traffic_model_comparison.png\n")
 
 
 if __name__ == "__main__":

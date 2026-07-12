@@ -66,6 +66,70 @@ def rolling_mae_for(predictor, series: list[float], min_history: int) -> dict:
     }
 
 
+def compute_forecast_metrics(actual: list[float], predicted: list[float]) -> dict:
+    """
+    Full one-step-ahead forecast accuracy report for a (actual, predicted)
+    pair of equal-length series, collected slot-by-slot during a simulation
+    run (as opposed to rolling_mae_for, which re-derives a series
+    out-of-sample from scratch - this works directly off whatever the engine
+    actually saw and predicted each slot).
+
+    Returns:
+      n                     - number of paired observations
+      mae                   - mean absolute error
+      mse                   - mean squared error
+      rmse                  - root mean squared error
+      smape                 - symmetric MAPE (%), robust to actual==0 slots
+                               (ordinary MAPE is undefined/explodes whenever
+                               backlog is 0, which happens often in calm
+                               slots, so sMAPE is used instead)
+      bias                  - mean signed error (predicted - actual); >0 means
+                               the forecaster tends to over-predict, <0 under-
+                               predict
+      directional_accuracy  - fraction of slots where the forecaster's
+                               predicted direction of change (vs the previous
+                               actual value) matched the actual direction of
+                               change. This is the paper's actual claimed
+                               mechanism (earlier directional signal ahead of
+                               a spike), so it's reported alongside the
+                               point-forecast error metrics rather than
+                               instead of them.
+    """
+    n = min(len(actual), len(predicted))
+    if n == 0:
+        return {"n": 0, "mae": float("nan"), "mse": float("nan"), "rmse": float("nan"),
+                "smape": float("nan"), "bias": float("nan"), "directional_accuracy": float("nan")}
+
+    a = actual[:n]
+    p = predicted[:n]
+    errors = [p[i] - a[i] for i in range(n)]
+    abs_errors = [abs(e) for e in errors]
+    sq_errors = [e * e for e in errors]
+
+    denom = [max(abs(a[i]) + abs(p[i]), 1e-6) for i in range(n)]
+    smape_terms = [200.0 * abs_errors[i] / denom[i] for i in range(n)]
+
+    dir_correct, dir_total = 0, 0
+    for i in range(1, n):
+        actual_delta = a[i] - a[i - 1]
+        pred_delta = p[i] - a[i - 1]
+        if actual_delta == 0:
+            continue  # flat ground truth has no direction to match
+        dir_total += 1
+        if (actual_delta > 0) == (pred_delta > 0):
+            dir_correct += 1
+
+    return {
+        "n": n,
+        "mae": sum(abs_errors) / n,
+        "mse": sum(sq_errors) / n,
+        "rmse": (sum(sq_errors) / n) ** 0.5,
+        "smape": sum(smape_terms) / n,
+        "bias": sum(errors) / n,
+        "directional_accuracy": (100.0 * dir_correct / dir_total) if dir_total else float("nan"),
+    }
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  Holt-Winters damped-trend predictor (the paper's proposed method)
 # ═══════════════════════════════════════════════════════════════════════════
